@@ -4,7 +4,7 @@ from datetime import datetime, timezone, timedelta
 def lambda_handler(event, context):
     ec2 = boto3.client('ec2')
     today = datetime.now(timezone.utc)
-    retention_days = 0
+    retention_days = 14
     deleted = 0
 
     snapshots = ec2.describe_snapshots(OwnerIds=['self'])['Snapshots']
@@ -17,7 +17,7 @@ def lambda_handler(event, context):
 
         print(f"Checking snapshot {snapshot_id}, Age: {age} days")
 
-        if age >=0:
+        if age >retention_days:
             print(f"Deleting snapshot: {snapshot_id} (Age: {age} days)")
             ec2.delete_snapshot(SnapshotId=snapshot_id)
             deleted += 1
