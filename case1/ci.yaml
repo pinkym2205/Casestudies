@@ -1,0 +1,191 @@
+name: EKS CI/CD Pipeline
+
+on:
+  push:
+    branches: [dev, qa, prod, main]
+
+env:
+  CLUSTER_NAME: ct-cluster
+  ECR_URI: 634898291786.dkr.ecr.us-east-1.amazonaws.com/ct-ecr
+  DEPLOYMENT_NAME: springbootapp
+  SERVICE_NAME: springbootapp-service
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+
+  setup:
+    name: Set Deployment Environment
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.setenv.outputs.env }}
+    steps:
+      - name: Set Environment
+        id: setenv
+        run: |
+          BRANCH=${GITHUB_REF##*/}
+          if [[ "$BRANCH" == "dev" ]]; then
+            echo "env=dev" >> $GITHUB_OUTPUT
+          elif [[ "$BRANCH" == "qa" ]]; then
+            echo "env=qa" >> $GITHUB_OUTPUT
+          else
+            echo "env=prod" >> $GITHUB_OUTPUT
+          fi
+  build-test:
+    name: Build & Test (Parallel)
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        job: [junit, sonar]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Build with Maven
+        if: matrix.job == 'junit'
+        run: mvn clean install
+
+      - name: Run JUnit Tests
+        if: matrix.job == 'junit'
+        run: mvn test
+
+      - name: Analyze with SonarQube
+        if: matrix.job == 'sonar'
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          mvn sonar:sonar \
+            -Dsonar.projectKey=pinkym2205_Javaspringboot-microservice \
+            -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }} \
+            -Dsonar.login=$SONAR_TOKEN
+
+  quality-gate:
+    name: Check Sonar Quality Gate
+    needs: build-test
+    runs-on: ubuntu-latest
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      AWS_REGION: us-east-1
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Wait for SonarCloud processing
+        run: sleep 30
+
+      - name: Check SonarCloud Quality Gate
+        run: |
+          STATUS=$(curl -s -u "$SONAR_TOKEN:" \
+            "${{ secrets.SONAR_HOST_URL }}/api/qualitygates/project_status?projectKey=pinkym2205_Javaspringboot-microservice" \
+            | jq -r '.projectStatus.status')
+          echo "Quality Gate Status: $STATUS"
+          if [[ "$STATUS" != "OK" ]]; then
+            aws sns publish \
+              --region $AWS_REGION \
+              --topic-arn "${{ secrets.SNS_TOPIC_ARN }}" \
+              --message "❌ SonarQube Quality Gate failed for ${{ github.ref_name }} branch."
+            exit 1
+          fi
+  docker-build:
+    name: Docker Build, Scan, Push
+    needs: quality-gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        run: aws ecr get-login-password | docker login --username AWS --password-stdin $ECR_URI
+
+      - name: Build Docker image
+        run: docker build -t $ECR_URI:${{ github.sha }} .
+
+      - name: Scan Docker image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.ECR_URI }}:${{ github.sha }}
+          severity: CRITICAL
+          format: table
+          exit-code: 1
+
+      - name: Push Docker image to ECR
+        run: docker push $ECR_URI:${{ github.sha }}
+
+  deploy:
+    name: Deploy to EKS
+    needs: [setup, docker-build]
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ needs.setup.outputs.environment }}
+      url: https://console.aws.amazon.com/eks/home
+    if: ${{ needs.setup.outputs.environment != 'prod' }}
+    steps:
+      - name: Checkout repository  
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --region ${{ secrets.AWS_REGION }} --name $CLUSTER_NAME
+
+      - name: Deploy to ${{ needs.setup.outputs.environment }} namespace
+        run: |
+          kubectl apply --validate=false -f k8s/${{ needs.setup.outputs.environment }}/deployment.yaml
+          kubectl apply --validate=false -f k8s/${{ needs.setup.outputs.environment }}/service.yaml
+          kubectl set image deployment/${{ env.DEPLOYMENT_NAME }} \
+          ${{ env.DEPLOYMENT_NAME }}=$ECR_URI:${{ github.sha }} \
+          -n ${{ needs.setup.outputs.environment }}
+  prod-approval:
+    name: Manual Approval for Prod
+    if: github.ref_name == 'prod'
+    needs: docker-build
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://console.aws.amazon.com/eks/home
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Waiting for manual approval in GitHub Environment
+        run: echo "🛑 Awaiting approval in the 'production' environment..."
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --region ${{ secrets.AWS_REGION }} --name $CLUSTER_NAME
+
+      - name: Deploy to production namespace
+        run: |
+          kubectl apply -f k8s/prod/deployment.yaml
+          kubectl apply -f k8s/prod/service.yaml
+          kubectl set image deployment/${{ env.DEPLOYMENT_NAME }} \
+            ${{ env.DEPLOYMENT_NAME }}=$ECR_URI:${{ github.sha }} \
+            -n prod

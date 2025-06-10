@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: springbootapp
+  namespace: qa
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: springbootapp
+  template:
+    metadata:
+      labels:
+        app: springbootapp
+    spec:
+      serviceAccountName: ecr-reader
+      containers:
+        - name: springbootapp
+          image: 634898291786.dkr.ecr.us-east-1.amazonaws.com/ct-ecr:{{IMAGE_TAG}}
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 30
